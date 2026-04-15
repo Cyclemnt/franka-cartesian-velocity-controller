@@ -1,0 +1,9 @@
+<library path="my_franka_controllers">
+  <class name="my_franka_controllers/CartesianVelocityController" 
+         type="my_franka_controllers::CartesianVelocityController" 
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Cartesian Velocity Controller using Pinocchio and Eigen.
+    </description>
+  </class>
+</library>
