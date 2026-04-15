@@ -29,7 +29,7 @@ private:
     double duration{0.0};
 
     // Limits
-    static constexpr double SAFETY_FACTOR = 0.5;
+    static constexpr double SAFETY_FACTOR = 0.2;
     const double max_linear_vel{2.00 * SAFETY_FACTOR};   // m/s, not sure what to place here
     const double max_angular_vel{2.62 * SAFETY_FACTOR};  // rad/s, same
     const double min_duration{0.5};        // seconds (safety margin)

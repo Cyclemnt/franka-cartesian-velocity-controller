@@ -61,6 +61,7 @@ private:
     // Pinocchio Kinematics
     pinocchio::Model model;
     std::shared_ptr<pinocchio::Data> data;
+    std::shared_ptr<pinocchio::Data> data_tmp;
     pinocchio::FrameIndex ee_frame_id;
 
     // Pre-allocated Math Variables
@@ -85,21 +86,35 @@ private:
     // Nullspace control variables
     double K_null;
     Eigen::Matrix<double, 7, 1> q_mid;
+    Eigen::Matrix<double, 7, 1> dq_limit;
     Eigen::Matrix<double, 7, 1> dq_null;
+    Eigen::Matrix<double, 7, 1> dq_task;
+    Eigen::Matrix<double, 7, 1> q_perturbed;
     Eigen::Matrix<double, 7, 7> I7;
     Eigen::Matrix<double, 7, 7> N;
+    Eigen::Matrix<double, 6, 7> J_tmp;
+
+    Eigen::Matrix<double, 7, 1> grad_w_cached;   // updated slowly
+    std::atomic<int> grad_cycle_counter{0};
+    static constexpr int GRAD_CYCLE_PERIOD = 50; // update every 50 cycle
+
+    const double w_manip_weight{0.3};
+    const double w_limit_weight{0.7};
     
     // Damped pseudo-inverse variables
     Eigen::Matrix<double, 6, 6> I6;
     Eigen::Matrix<double, 6, 6> JJt;
     Eigen::Matrix<double, 6, 6> JJt_inv;
     Eigen::Matrix<double, 7, 6> J_pinv;
-    double lambda_damping;
+    double lambda_damping{1e-4};
     Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt_solver;
+
+    // Security
+    rclcpp::Time last_target_time{0};
+    double activation_ramp{0.0};
 
     // Low pass filter
     Eigen::Matrix<double, 7, 1> dq_cmd_prev;
-    double filter_alpha;
 };
 
 }  // namespace my_franka_controllers

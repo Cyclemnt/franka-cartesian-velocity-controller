@@ -38,12 +38,14 @@ controller_interface::CallbackReturn CartesianVelocityController::on_configure(c
     // Build Pinocchio model from URDF string
     pinocchio::urdf::buildModelFromXML(urdf_string, model);
     data = std::make_shared<pinocchio::Data>(model);
+    data_tmp = std::make_shared<pinocchio::Data>(model);
     ee_frame_id = model.getFrameId(end_effector_frame);
 
     // Set Eigen matrices
     size_t num_joints = joint_names.size();
     dq_max << 2.62, 2.62, 2.62, 2.62, 5.26, 5.26, 5.26; // rad/s
     dq_cmd.setZero();
+    dq_cmd_prev.setZero();
     // Control law
     K_gain.setZero();
     K_gain.diagonal() << 10.0, 10.0, 10.0, 5.0, 5.0, 5.0; // P-Gains for [x, y, z, roll, pitch, yaw]
@@ -51,10 +53,11 @@ controller_interface::CallbackReturn CartesianVelocityController::on_configure(c
     I6.setIdentity();
     JJt.setZero();
     JJt_inv.setZero();
-    llt_solver.compute(Eigen::Matrix<double,6,6>::Identity());
+    llt_solver.compute(Eigen::Matrix<double, 6, 6>::Identity());
     // Nullspace control
     K_null = 0.8;
     I7.setIdentity();
+    grad_w_cached.setZero();
     // Franka mid configuration
     for (size_t i = 0; i < num_joints; ++i) {
         double upper = model.upperPositionLimit[i];
@@ -63,8 +66,6 @@ controller_interface::CallbackReturn CartesianVelocityController::on_configure(c
         if (upper > 1e3 || lower < -1e3) q_mid(i) = 0.0; // For continuous joints
         else q_mid(i) = (upper + lower) / 2.0; // Else middle
     }
-    // Low pass filter
-    filter_alpha = 0.1;
 
     // Initialize Realtime Buffer with an empty target
     TargetPose init_target;
@@ -140,6 +141,7 @@ controller_interface::CallbackReturn CartesianVelocityController::on_activate(co
     TargetPose reset;
     reset.valid = false;
     rt_target_pose_ptr.writeFromNonRT(reset);
+    last_target_time = get_node()->now();
 
     RCLCPP_INFO(get_node()->get_logger(), "Controller activated. Holding current pose.");
     return controller_interface::CallbackReturn::SUCCESS;
@@ -158,14 +160,30 @@ controller_interface::CallbackReturn CartesianVelocityController::on_deactivate(
 // -------------------------------------------------------------------------
 // update: 1kHz real-time loop. NO MEMORY ALLOCATION
 // -------------------------------------------------------------------------
-controller_interface::return_type CartesianVelocityController::update(const rclcpp::Time& time, const rclcpp::Duration& /*period*/)  {
-    // Read target from subscriber (thread-safe)
+controller_interface::return_type CartesianVelocityController::update(const rclcpp::Time& time, const rclcpp::Duration& period)  {
+    const double dt = period.seconds();
+
+    // =========================================================
+    // READ TARGET + WATCHDOG TIMEOUT
+    // =========================================================
+    // Read target from subscriber
     TargetPose* target_ptr = rt_target_pose_ptr.readFromRT();
     if (target_ptr && target_ptr->valid) {
         x_target = target_ptr->position;
         quat_target = target_ptr->orientation;
+        last_target_time = time;
+    }
+    
+    // Safe stop if no target for 500ms
+    if ((time - last_target_time).seconds() > 0.5) {
+        for (size_t i = 0; i < 7; ++i) command_interfaces_[i].set_value(0.0);
+        dq_cmd_prev.setZero();
+        return controller_interface::return_type::OK;
     }
 
+    // =========================================================
+    // READ JOINTS + PINOCCHIO KINEMATICS
+    // =========================================================
     // Read Current Joint States
     for (size_t i = 0; i < joint_names.size(); ++i) {
         q_current(i) = state_interfaces_[i].get_value();
@@ -175,31 +193,43 @@ controller_interface::return_type CartesianVelocityController::update(const rclc
     pinocchio::computeJointJacobians(model, *data, q_current);
     pinocchio::updateFramePlacements(model, *data);
     pinocchio::getFrameJacobian(model, *data, ee_frame_id, pinocchio::LOCAL_WORLD_ALIGNED, jacobian);
+
     // Update vectors
     x_current = data->oMf[ee_frame_id].translation();
     quat_current = Eigen::Quaterniond(data->oMf[ee_frame_id].rotation());
     quat_current.normalize();
 
+    // =========================================================
+    // CARTESIAN ERROR
+    // =========================================================
     // Compute errors
     pos_error = x_target - x_current;  // Position error
-    quat_error = quat_target * quat_current.inverse();   // Quaternion error
-    if (quat_error.w() < 0) quat_error.coeffs() *= -1.0; // Ensure shortest path for rotation
-    // ori_error = pinocchio::log3(quat_error.toRotationMatrix());  // Orientation error
-    ori_error = 2.0 * quat_error.vec();  // Orientation error approx and faster
-    twist_error << pos_error, ori_error;  // Total twist error vector
 
-    // Adaptive Damped Pseudo-Inverse: J^# = J^T * (J * J^T + lambda^2 * I)^-1
+    quat_error = quat_target * quat_current.inverse();   // Quaternion error
+    if (quat_error.w() < 0) quat_error.coeffs() *= -1.0; // shortest path for rotation
+
+    ori_error = 2.0 * quat_error.vec();   // Orientation error approximation but faster than pinocchio::log3(quat_error.toRotationMatrix())
+
+    twist_error << pos_error, ori_error;  // Total twist error vector
+    const double error_norm = twist_error.norm();
+
+    // =========================================================
+    // ADAPTATIVE DAMPED PSEUDO-INVERSE
+    // =========================================================
+    // J^# = J^T * (J * J^T + lambda^2 * I)^-1
     JJt.noalias() = jacobian * jacobian.transpose();
 
     // Adaptive lambda
-    double manipulability_proxy = JJt.trace() / 6.0;
-    const double lambda_min = 1e-4;
-    const double lambda_max = 1e-2;
-    const double w_threshold = 1e-3;  // singularity warning region
-    double lambda_damping = lambda_min;
-    if (manipulability_proxy < w_threshold) {
-        const double r = 1.0 - (manipulability_proxy / w_threshold);
-        lambda_damping = lambda_min + (lambda_max - lambda_min) * r * r;
+    const double manipulability_proxy = JJt.trace() / 6.0;  // manipulability proxy O(n), avoiding déterminant
+    {
+        constexpr double lambda_min = 1e-4;
+        constexpr double lambda_max = 5e-2;
+        constexpr double w_threshold = 1e-3;  // singularity warning region
+        lambda_damping = lambda_min;
+        if (manipulability_proxy < w_threshold) {
+            const double r = 1.0 - (manipulability_proxy / w_threshold);
+            lambda_damping = lambda_min + (lambda_max - lambda_min) * r * r;
+        }
     }
 
     // Computing J_pinv
@@ -207,62 +237,117 @@ controller_interface::return_type CartesianVelocityController::update(const rclc
     llt_solver.compute(JJt);
     JJt_inv.noalias() = llt_solver.solve(I6);
     J_pinv.noalias() = jacobian.transpose() * JJt_inv;
+    
+    // =========================================================
+    // MAIN TASK with fade-in
+    // =========================================================
+    // Avoid speed bumps if target is far at activation
+    activation_ramp = std::min(activation_ramp + dt / 0.5, 1.0); // 500 ms ramp
 
-    // Nullspace control
-    // dq_null = -K_null * (q_current - q_mid);  // This is the original idea but too strong
-    // Calculate the gradient of a cost function that penalizes limit proximity
-    for (int i = 0; i < q_current.size(); ++i) {
-        double eps = 1e-3;  // Avoid division by zero
-        double dist_upper = std::max(model.upperPositionLimit[i] - q_current(i), eps);
-        double dist_lower = std::max(q_current(i) - model.lowerPositionLimit[i], eps);
-        // dq_null(i) = K_null * (1.0 / dist_lower - 1.0 / dist_upper);
-        double range = model.upperPositionLimit[i] - model.lowerPositionLimit[i];
-        if (dist_upper < 0.3 * range || dist_lower < 0.3 * range) {
-            dq_null(i) = K_null * (1.0 / dist_lower - 1.0 / dist_upper);
-            if (dq_null(i) > dq_max(i)) dq_null(i) = dq_max(i);
-            else if (dq_null(i) < -dq_max(i)) dq_null(i) = -dq_max(i);
-        } else {
-            // High damping/friction simulation in the nullspace
-            dq_null(i) = 0.0; 
+    dq_task.noalias() = J_pinv * (K_gain * twist_error);
+
+    // =========================================================
+    // NULLSPACE manipulability gradient
+    // =========================================================
+    // manipulability gradient updated at 50 Hz
+    grad_cycle_counter++;
+    if (grad_cycle_counter >= GRAD_CYCLE_PERIOD) {
+        grad_cycle_counter = 0;
+
+        const double w_curr = std::sqrt((jacobian * jacobian.transpose()).determinant() + 1e-12);
+
+        constexpr double delta = 1e-4;
+        for (int i = 0; i < 7; ++i) {
+            q_perturbed = q_current;
+            q_perturbed(i) += delta;
+
+            pinocchio::computeJointJacobians(model, *data_tmp, q_perturbed);
+            pinocchio::updateFramePlacements(model, *data_tmp);
+            J_tmp.setZero();
+            pinocchio::getFrameJacobian(model, *data_tmp, ee_frame_id, pinocchio::LOCAL_WORLD_ALIGNED, J_tmp);
+
+
+            Eigen::Matrix<double, 6, 6> JJt_tmp = J_tmp * J_tmp.transpose();
+            JJt_tmp.diagonal().array() += 1e-12;
+            const double w_tmp = std::sqrt(JJt_tmp.determinant());
+            grad_w_cached(i) = (w_tmp - w_curr) / delta;
+        }
+
+        if (grad_w_cached.norm() > 1e-8) grad_w_cached /= grad_w_cached.norm();
+    }
+
+    // Repulse joint limits
+    for (int i = 0; i < 7; ++i) {
+        constexpr double eps = 1e-3;
+        const double dist_upper = std::max(model.upperPositionLimit[i] - q_current(i), eps);
+        const double dist_lower = std::max(q_current(i) - model.lowerPositionLimit[i], eps);
+        const double range  = model.upperPositionLimit[i] - model.lowerPositionLimit[i];
+        dq_limit(i) = (dist_upper < 0.3 * range || dist_lower < 0.3 * range) ? (1.0 / dist_lower - 1.0 / dist_upper) : 0.0;
+    }
+
+    // Fusion + project into nullspace
+    // Blend nullspace when goal is reached toavoid vibrations
+    const double null_blend = (error_norm > 0.01) ? 1.0 : (error_norm < 0.001) ? 0.0 : (error_norm - 0.001) / 0.009;
+
+    dq_null.noalias() = K_null * (w_manip_weight * grad_w_cached + w_limit_weight * dq_limit);
+    N.noalias() = I7 - J_pinv * jacobian;
+
+    // Total Joint Velocity Command
+    dq_cmd = activation_ramp * dq_task + null_blend * N * dq_null;
+
+    // =========================================================
+    // SECURITIES
+    // =========================================================
+    // Global scaling
+    {
+        double scale = 1.0;
+        for (int i = 0; i < 7; ++i) {
+            const double ratio = std::abs(dq_cmd(i)) / dq_max(i);
+            if (ratio > 1.0) scale = std::min(scale, 1.0 / ratio);
+        }
+        dq_cmd *= scale;
+    }
+
+    // Joint clamping regarding joint limit proximity
+    {
+        constexpr double margin      = 0.262; // rad (slow down zone)
+        constexpr double hard_margin = 0.020; // rad (stop zone)
+        for (int i = 0; i < 7; ++i) {
+            const double dist_upper = model.upperPositionLimit[i] - q_current(i);
+            const double dist_lower = q_current(i) - model.lowerPositionLimit[i];
+
+            if (dq_cmd(i) > 0.0 && dist_upper < margin) {
+                dq_cmd(i) *= (dist_upper < hard_margin) ? 0.0 : (dist_upper - hard_margin) / (margin - hard_margin);
+            }
+            if (dq_cmd(i) < 0.0 && dist_lower < margin) {
+                dq_cmd(i) *= (dist_lower < hard_margin) ? 0.0 : (dist_lower - hard_margin) / (margin - hard_margin);
+            }
         }
     }
-    N.noalias() = I7 - J_pinv * jacobian;  // Project into nullspace
 
-    double error_norm = twist_error.norm();
-    double nullspace_multiplier = 1.0;
-    if (error_norm < 0.001) { // If error < 1mm / 0.001 rad
-        nullspace_multiplier = 0.0; // Kill the nullspace entirely when at goal
-    } else if (error_norm < 0.01) {
-        nullspace_multiplier = error_norm / 0.01; // Smoothly fade it out
-    }
-
-    // Compute Joint Velocity Command
-    dq_cmd.noalias() = J_pinv * (K_gain * twist_error) + nullspace_multiplier * N * dq_null;
-
-    // Scale down
-    double scale = 1.0;
-    for (int i = 0; i < dq_cmd.size(); ++i) {
-        double ratio = std::abs(dq_cmd(i)) / dq_max(i);
-        if (ratio > 1.0) scale = std::min(scale, 1.0 / ratio);
-    }
-    dq_cmd *= scale;
-
-    // Low pass filter
-    dq_cmd.noalias() = filter_alpha * dq_cmd + (1.0 - filter_alpha) * dq_cmd_prev;
+    // =========================================================
+    // LOW PASS FILTER + WRITE IN HARDWARE INTERFACE
+    // =========================================================
+    // Adaptative alpha
+    const double alpha = (error_norm > 0.05) ? 0.4 : 0.15;
+    dq_cmd = alpha * dq_cmd + (1.0 - alpha) * dq_cmd_prev;
     dq_cmd_prev = dq_cmd;
 
     // Write Filtered Commands to Hardware Interface
-    for (size_t i = 0; i < joint_names.size(); ++i) {
+    for (size_t i = 0; i < 7; ++i) {
         command_interfaces_[i].set_value(dq_cmd(i));
     }
     
-    // Publish errors; try_lock() to not block the 1000Hz thread
+    // =========================================================
+    // DIAGNOSTICS PUBLISHING
+    // =========================================================
+    // try_lock() to not block the 1000Hz thread
     if (rt_error_pub && rt_error_pub->trylock()) {
-        rt_error_pub->msg_.header.stamp = time;
+        rt_error_pub->msg_.header.stamp    = time;
         rt_error_pub->msg_.header.frame_id = end_effector_frame;
-        rt_error_pub->msg_.twist.linear.x = pos_error.x();
-        rt_error_pub->msg_.twist.linear.y = pos_error.y();
-        rt_error_pub->msg_.twist.linear.z = pos_error.z();
+        rt_error_pub->msg_.twist.linear.x  = pos_error.x();
+        rt_error_pub->msg_.twist.linear.y  = pos_error.y();
+        rt_error_pub->msg_.twist.linear.z  = pos_error.z();
         rt_error_pub->msg_.twist.angular.x = ori_error.x();
         rt_error_pub->msg_.twist.angular.y = ori_error.y();
         rt_error_pub->msg_.twist.angular.z = ori_error.z();
