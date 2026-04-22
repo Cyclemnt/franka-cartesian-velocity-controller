@@ -19,9 +19,28 @@ find_package(pinocchio REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 
+find_package(task REQUIRED)
+find_package(qp REQUIRED)
+find_package(robot_kinematics REQUIRED)
+find_package(auxiliaries_function_and_structures REQUIRED)
+find_package(OpenMP REQUIRED)
+
+# #GUROBI
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}")
+find_package(GUROBI REQUIRED)
+if(GUROBI_FOUND)
+  message(STATUS "GUROBI FOUND")
+else(GUROBI_FOUND)
+  message(FATAL_ERROR "GUROBI NOT FOUND!")
+endif(GUROBI_FOUND)
+
+link_directories(${CMAKE_CURRENT_BINARY_DIR}/../qp)
+link_directories(/home/cyclement/franka_ros2_ws/install/qp/lib)
+
 # Create the library
 add_library(${PROJECT_NAME} SHARED
   src/cartesian_velocity_controller.cpp
+  src/hqp_cartesian_velocity_controller.cpp
 )
 
 # Include directories
@@ -47,6 +66,11 @@ ament_target_dependencies(${PROJECT_NAME}
   sensor_msgs
   realtime_tools
   pluginlib
+
+  task
+  qp
+  robot_kinematics
+  auxiliaries_function_and_structures
 )
 
 ament_target_dependencies(trajectory_generator_node
@@ -63,6 +87,10 @@ ament_target_dependencies(trajectory_generator_node
 target_link_libraries(${PROJECT_NAME}
   Eigen3::Eigen
   pinocchio::pinocchio
+  ${qp_LIBRARIES}     # <--- Use the variable ROS 2 creates
+  ${task_LIBRARIES}   # <--- Use the variable for task as well
+  ${GUROBI_CXX_LIBRARY}
+  ${GUROBI_LIBRARY}
 )
 
 target_link_libraries(trajectory_generator_node

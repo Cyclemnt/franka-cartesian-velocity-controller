@@ -6,4 +6,12 @@
       Cartesian Velocity Controller using Pinocchio and Eigen.
     </description>
   </class>
+
+  <class name="my_franka_controllers/HqpCartesianVelocityController" 
+         type="my_franka_controllers::HqpCartesianVelocityController" 
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Hierarchical QP Cartesian Velocity Controller using Gurobi and FrankaKinematics.
+    </description>
+  </class>
 </library>

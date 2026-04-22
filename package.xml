@@ -16,11 +16,17 @@
   <depend>sensor_msgs</depend>
   <depend>realtime_tools</depend>
   <depend>pluginlib</depend>
+
+  <depend>task</depend>
+  <depend>qp</depend>
+  <depend>robot_kinematics</depend>
+  <depend>auxiliaries_function_and_structures</depend>
   
   <depend>eigen3</depend>
   <depend>pinocchio</depend>
 
   <export>
     <build_type>ament_cmake</build_type>
+    <controller_interface plugin="${prefix}/plugin.xml" />
   </export>
 </package>
