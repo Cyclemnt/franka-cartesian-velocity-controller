@@ -14,11 +14,12 @@
 // ROS 2 Messages
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 
 // Eigen & HQP Architecture
 #include <Eigen/Dense>
 #include <task/task.h>
-#include <qp/QPSolver.h>
+#include <hierarchical_qp/hierarchicalQP.h>
 #include <robot_kinematics/FrankaKinematics.hpp>
 
 namespace my_franka_controllers {
@@ -55,20 +56,29 @@ private:
 
     std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::TwistStamped>> error_pub;
     std::shared_ptr<realtime_tools::RealtimePublisher<geometry_msgs::msg::TwistStamped>> rt_error_pub;
+    
+    std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::JointState>> dq_cmd_pub;
+    std::shared_ptr<realtime_tools::RealtimePublisher<sensor_msgs::msg::JointState>> rt_dq_cmd_pub;
 
     // HQP Components
     std::shared_ptr<FrankaKinematics> kinematics;
-    std::shared_ptr<QPSolver> solver;
+    std::shared_ptr<HierarchicalQP> solver;
     
     // The Task Stack: Holds pointers to the base Task class
     std::vector<std::shared_ptr<Task>> task_stack;
+    std::shared_ptr<JointsConfigurationLimits> q_upper_task;
+    std::shared_ptr<JointsConfigurationLimits> q_lower_task;
+    std::shared_ptr<JointsVelocityLimits> dq_upper_task;
+    std::shared_ptr<JointsVelocityLimits> dq_lower_task;
     std::shared_ptr<Pose> pose_task;
 
     // Math Variables
     Eigen::Matrix<double, 7, 1> q_current;
+    Eigen::Matrix<double, 7, 1> q_max;
+    Eigen::Matrix<double, 7, 1> q_min;
     Eigen::Matrix<double, 7, 1> dq_cmd;
     Eigen::Matrix<double, 7, 1> dq_cmd_prev;
-    Eigen::Matrix<double, 7, 1> dq_max;
+    Eigen::Matrix<double, 7, 1> dq_limit;
     
     Eigen::Vector3d x_target;
     Eigen::Quaterniond quat_target;

@@ -19,6 +19,7 @@
 
   <depend>task</depend>
   <depend>qp</depend>
+  <depend>hierarchical_qp</depend>
   <depend>robot_kinematics</depend>
   <depend>auxiliaries_function_and_structures</depend>
   

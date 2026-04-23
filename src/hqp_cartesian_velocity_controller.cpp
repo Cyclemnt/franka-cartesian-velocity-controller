@@ -32,7 +32,9 @@ controller_interface::CallbackReturn HqpCartesianVelocityController::on_init() {
 // -------------------------------------------------------------------------
 controller_interface::CallbackReturn HqpCartesianVelocityController::on_configure(const rclcpp_lifecycle::State& /*previous_state*/) {
     auto node = get_node();
-    dq_max << 2.62, 2.62, 2.62, 2.62, 5.26, 5.26, 5.26;
+    q_max <<    2.897,  1.832,  2.897, -0.122,  2.879,  4.625,  3.054;
+    q_min <<   -2.897, -1.832, -2.897, -3.071, -2.879,  0.436, -3.054;
+    dq_limit << 2.617,  2.617,  2.617,  2.617,  5.253,  5.253,  5.253;
     dq_cmd.setZero();
     dq_cmd_prev.setZero();
 
@@ -62,15 +64,23 @@ controller_interface::CallbackReturn HqpCartesianVelocityController::on_configur
     kinematics->getSelectTask()->assign(6, true);
 
     // Initialize Solver and Task Stack
-    solver = std::make_shared<QPSolver>();
+    solver = std::make_shared<HierarchicalQP>(7, GRB_CONTINUOUS);
     task_stack.clear();
 
-    // Create Primary Pose Task
-    Eigen::VectorXd weights = Eigen::VectorXd::Ones(6); 
-    pose_task = std::make_shared<Pose>(kinematics.get(), '=', weights);
-    pose_task->setGain(10.0);
+    // Create Tasks
+    q_upper_task = std::make_shared<JointsConfigurationLimits>(kinematics.get(), q_max, GRB_LESS_EQUAL, 10.0);
+    q_lower_task = std::make_shared<JointsConfigurationLimits>(kinematics.get(), q_min, GRB_GREATER_EQUAL, 10.0);
+    
+    dq_upper_task = std::make_shared<JointsVelocityLimits>(kinematics.get(), dq_limit, GRB_LESS_EQUAL, 10.0);
+    dq_lower_task = std::make_shared<JointsVelocityLimits>(kinematics.get(), -dq_limit, GRB_GREATER_EQUAL, 10.0);
+
+    pose_task = std::make_shared<Pose>(kinematics.get(), GRB_EQUAL, Eigen::VectorXd::Ones(6), 10.0);
     
     // Add to the stack (push_back new tasks here)
+    task_stack.push_back(q_upper_task);
+    task_stack.push_back(q_lower_task);
+    task_stack.push_back(dq_upper_task);
+    task_stack.push_back(dq_lower_task);
     task_stack.push_back(pose_task);
 
     // Target Subscription
@@ -86,6 +96,13 @@ controller_interface::CallbackReturn HqpCartesianVelocityController::on_configur
     // Setup error publisher
     error_pub = get_node()->create_publisher<geometry_msgs::msg::TwistStamped>("~/tracking_error", rclcpp::SystemDefaultsQoS());
     rt_error_pub = std::make_shared<realtime_tools::RealtimePublisher<geometry_msgs::msg::TwistStamped>>(error_pub);
+
+    // Setup dq_cmd publisher
+    dq_cmd_pub = get_node()->create_publisher<sensor_msgs::msg::JointState>("~/dq_cmd", rclcpp::SystemDefaultsQoS());
+    rt_dq_cmd_pub = std::make_shared<realtime_tools::RealtimePublisher<sensor_msgs::msg::JointState>>(dq_cmd_pub);
+
+    rt_dq_cmd_pub->msg_.velocity.resize(7);
+    rt_dq_cmd_pub->msg_.name = joint_names;
 
     RCLCPP_INFO(node->get_logger(), "CartesianVelocityController configured successfully.");
     return controller_interface::CallbackReturn::SUCCESS;
@@ -122,9 +139,9 @@ controller_interface::CallbackReturn HqpCartesianVelocityController::on_activate
     for (size_t i = 0; i < 7; ++i) { q_current(i) = state_interfaces_[i].get_value(); }
     kinematics->updateJointStates(q_current);
     
-    // If FrankaKinematics allows reading current pose, initialize x_target here to avoid jumps.
-    // x_target = ...
-    // quat_target = ...
+    // Should do: to avoid jumps
+    // x_target = x_current
+    // quat_target = quat_current
 
     activation_ramp = 0.0;
     last_target_time = get_node()->now();
@@ -177,27 +194,30 @@ controller_interface::return_type HqpCartesianVelocityController::update(const r
     // =========================================================
     // HQP SOLVER
     // =========================================================
-    // Formulate and Solve QP using the Task Stack
     try {
-        solver->clear(); // Reset Gurobi model constraints
-        solver->addVariables(7, 'C'); // 7 continuous joint velocities
+        int priority_level = 1;
         
         // Loop through all tasks and add them to the solver
         for(const auto& task : task_stack) {
-            // Assuming tasks are all Equality '=' constraints for now
-            // If Task class stores inequality type, pass it here
-            solver->addConstraints(task->get_A(), task->get_b(), '=', false);
+            // Arguments: A, b, slack, sense, priorityLevel
+            solver->addConstraints(task->get_A(), task->get_b(), task->get_slacks_state(), task->getConstraintSense(), priority_level);
+            priority_level++;
         }
         
-        // Objective: Minimize kinetic energy/joint velocities (1/2 * dq^T * I * dq)
-        solver->setObjectiveFunction(Eigen::MatrixXd::Identity(7, 7)); 
+        // Add Velocity Minimization as the LOWEST priority task
+        Eigen::MatrixXd A_damp = Eigen::MatrixXd::Identity(7, 7);
+        Eigen::VectorXd b_damp = Eigen::VectorXd::Zero(7);
+        solver->addConstraints(A_damp, b_damp, true, GRB_EQUAL, priority_level);
 
         // Solve
         solver->solve();
-        dq_cmd = solver->getVariablesValue();
+        dq_cmd = solver->getVarsValue();
+        
+        // Reset the solver for the next control loop
+        solver->reset();
 
     } catch (const std::exception& e) {
-        // Gurobi Exception Handling (e.g., Infeasible model, license error)
+        RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000, "HQP Solver Exception: %s", e.what());
         for (size_t i = 0; i < 7; ++i) command_interfaces_[i].set_value(0.0);
         return controller_interface::return_type::OK;
     }
@@ -213,7 +233,7 @@ controller_interface::return_type HqpCartesianVelocityController::update(const r
     {
         double scale = 1.0;
         for (int i = 0; i < 7; ++i) {
-            const double ratio = std::abs(dq_cmd(i)) / dq_max(i);
+            const double ratio = std::abs(dq_cmd(i)) / dq_limit(i);
             if (ratio > 1.0) scale = std::min(scale, 1.0 / ratio);
         }
         dq_cmd *= scale;
@@ -247,6 +267,12 @@ controller_interface::return_type HqpCartesianVelocityController::update(const r
         rt_error_pub->msg_.twist.angular.y = ori_error.y();
         rt_error_pub->msg_.twist.angular.z = ori_error.z();
         rt_error_pub->unlockAndPublish();
+    }
+
+    if (rt_dq_cmd_pub && rt_dq_cmd_pub->trylock()) {
+        rt_dq_cmd_pub->msg_.header.stamp = time;
+        for (size_t i = 0; i < 7; ++i) rt_dq_cmd_pub->msg_.velocity[i] = dq_cmd(i);
+        rt_dq_cmd_pub->unlockAndPublish();
     }
 
     return controller_interface::return_type::OK;

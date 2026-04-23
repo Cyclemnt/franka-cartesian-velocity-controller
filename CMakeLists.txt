@@ -21,6 +21,7 @@ find_package(tf2_eigen REQUIRED)
 
 find_package(task REQUIRED)
 find_package(qp REQUIRED)
+find_package(hierarchical_qp REQUIRED)
 find_package(robot_kinematics REQUIRED)
 find_package(auxiliaries_function_and_structures REQUIRED)
 find_package(OpenMP REQUIRED)
@@ -69,6 +70,7 @@ ament_target_dependencies(${PROJECT_NAME}
 
   task
   qp
+  hierarchical_qp
   robot_kinematics
   auxiliaries_function_and_structures
 )
