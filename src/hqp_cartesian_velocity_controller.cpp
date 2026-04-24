@@ -35,6 +35,7 @@ controller_interface::CallbackReturn HqpCartesianVelocityController::on_configur
     q_max <<    2.897,  1.832,  2.897, -0.122,  2.879,  4.625,  3.054;
     q_min <<   -2.897, -1.832, -2.897, -3.071, -2.879,  0.436, -3.054;
     dq_limit << 2.617,  2.617,  2.617,  2.617,  5.253,  5.253,  5.253;
+    // dq_limit <<   0.5,    0.5,    0.5,    0.5,    0.5,    0.5,    0.5;
     dq_cmd.setZero();
     dq_cmd_prev.setZero();
 
@@ -70,19 +71,39 @@ controller_interface::CallbackReturn HqpCartesianVelocityController::on_configur
     // Create Tasks
     q_upper_task = std::make_shared<JointsConfigurationLimits>(kinematics.get(), q_max, GRB_LESS_EQUAL, 10.0);
     q_lower_task = std::make_shared<JointsConfigurationLimits>(kinematics.get(), q_min, GRB_GREATER_EQUAL, 10.0);
+    q_upper_task->set_priority_level(1);
+    q_lower_task->set_priority_level(1);
+    q_upper_task->set_slacks_state(true);
+    q_lower_task->set_slacks_state(true);
+    task_stack.push_back(q_upper_task);
+    task_stack.push_back(q_lower_task);
     
     dq_upper_task = std::make_shared<JointsVelocityLimits>(kinematics.get(), dq_limit, GRB_LESS_EQUAL, 10.0);
     dq_lower_task = std::make_shared<JointsVelocityLimits>(kinematics.get(), -dq_limit, GRB_GREATER_EQUAL, 10.0);
-
-    pose_task = std::make_shared<Pose>(kinematics.get(), GRB_EQUAL, Eigen::VectorXd::Ones(6), 10.0);
-    
-    // Add to the stack (push_back new tasks here)
-    task_stack.push_back(q_upper_task);
-    task_stack.push_back(q_lower_task);
+    dq_upper_task->set_priority_level(1);
+    dq_lower_task->set_priority_level(1);
+    dq_upper_task->set_slacks_state(true);
+    dq_lower_task->set_slacks_state(true);
     task_stack.push_back(dq_upper_task);
     task_stack.push_back(dq_lower_task);
-    task_stack.push_back(pose_task);
 
+    // Define a virtual wall
+    Eigen::Vector3d p1(1.0, 0.0, 0.15);
+    Eigen::Vector3d p2(0.0, 1.0, 0.15);
+    Eigen::Vector3d p3(-1.0, -1.0, 0.15);
+    Eigen::VectorXi joints_to_protect(2);
+    joints_to_protect << 4, 7; // Protecting joint 4 (elbow) and 7 (flange)
+    double min_dist = 0.05; // 5cm buffer
+    virtual_wall_task = std::make_shared<VirtualWall>(kinematics.get(), p1, p2, p3, joints_to_protect, min_dist, GRB_GREATER_EQUAL, 10.0);
+    virtual_wall_task->set_priority_level(1);
+    virtual_wall_task->set_slacks_state(true);
+    task_stack.push_back(virtual_wall_task);
+
+    pose_task = std::make_shared<Pose>(kinematics.get(), GRB_EQUAL, Eigen::VectorXd::Ones(6), 10.0);
+    pose_task->set_priority_level(2);
+    pose_task->set_slacks_state(true);
+    task_stack.push_back(pose_task);
+    
     // Target Subscription
     target_pose_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>("~/target_pose", 10,
         [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -200,14 +221,14 @@ controller_interface::return_type HqpCartesianVelocityController::update(const r
         // Loop through all tasks and add them to the solver
         for(const auto& task : task_stack) {
             // Arguments: A, b, slack, sense, priorityLevel
-            solver->addConstraints(task->get_A(), task->get_b(), task->get_slacks_state(), task->getConstraintSense(), priority_level);
+            solver->addConstraints(task->get_A(), task->get_b(), task->get_slacks_state(), task->getConstraintSense(), task->get_priority_level());
             priority_level++;
         }
         
-        // Add Velocity Minimization as the LOWEST priority task
+        // Add Velocity minimization as the LOWEST priority task
         Eigen::MatrixXd A_damp = Eigen::MatrixXd::Identity(7, 7);
         Eigen::VectorXd b_damp = Eigen::VectorXd::Zero(7);
-        solver->addConstraints(A_damp, b_damp, true, GRB_EQUAL, priority_level);
+        solver->addConstraints(A_damp, b_damp, true, GRB_EQUAL, 3);
 
         // Solve
         solver->solve();

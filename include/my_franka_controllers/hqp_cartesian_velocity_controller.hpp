@@ -70,6 +70,7 @@ private:
     std::shared_ptr<JointsConfigurationLimits> q_lower_task;
     std::shared_ptr<JointsVelocityLimits> dq_upper_task;
     std::shared_ptr<JointsVelocityLimits> dq_lower_task;
+    std::shared_ptr<VirtualWall> virtual_wall_task;
     std::shared_ptr<Pose> pose_task;
 
     // Math Variables
