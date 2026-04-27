@@ -70,6 +70,7 @@ private:
     std::shared_ptr<JointsConfigurationLimits> q_lower_task;
     std::shared_ptr<JointsVelocityLimits> dq_upper_task;
     std::shared_ptr<JointsVelocityLimits> dq_lower_task;
+    std::shared_ptr<SelfHits> self_collision;
     std::shared_ptr<VirtualWall> virtual_wall_task;
     std::shared_ptr<Pose> pose_task;
 
@@ -80,6 +81,7 @@ private:
     Eigen::Matrix<double, 7, 1> dq_cmd;
     Eigen::Matrix<double, 7, 1> dq_cmd_prev;
     Eigen::Matrix<double, 7, 1> dq_limit;
+    Eigen::Matrix<double, 7, 1> ddq_limit;
     
     Eigen::Vector3d x_target;
     Eigen::Quaterniond quat_target;

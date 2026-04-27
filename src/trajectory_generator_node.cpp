@@ -15,7 +15,7 @@ TrajectoryGenerator::TrajectoryGenerator() : Node("trajectory_generator") {
     tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
 
     // 100 Hz
-    timer = this->create_wall_timer(10ms, std::bind(&TrajectoryGenerator::timer_callback, this)); // 100Hz enough?
+    timer = this->create_wall_timer(1ms, std::bind(&TrajectoryGenerator::timer_callback, this)); // 100Hz enough?
     
     RCLCPP_INFO(this->get_logger(), "Trajectory Generator Ready.");
 }
